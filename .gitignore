@@ -1,0 +1,12 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+.env
+node_modules/
+rendered-manifest.yaml
+tfplan
+*.tfvars.json
+.env.*

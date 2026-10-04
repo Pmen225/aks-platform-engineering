@@ -1,0 +1,75 @@
+name: validate-and-deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy to an already provisioned, billable AKS lab'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.4
+      - run: terraform fmt -check -recursive
+      - run: terraform -chdir=infra init -backend=false -input=false
+      - run: terraform -chdir=infra validate
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci --ignore-scripts && npm test && npm audit --omit=dev
+        working-directory: app
+      - name: Check image build
+        run: docker build -t portfolio-app:local app
+      - name: Validate Kubernetes resource schemas
+        uses: docker://ghcr.io/yannh/kubeconform:v0.7.0
+        with:
+          args: -strict -summary k8s/
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: portfolio
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      IMAGE_NAME: portfolio-app
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+      AKS_NAME: ${{ vars.AKS_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check configuration
+        run: |
+          test -n "$ACR_NAME" && test -n "$AKS_RESOURCE_GROUP" && test -n "$AKS_NAME"
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build immutable image in ACR
+        run: az acr build --registry "$ACR_NAME" --image "$IMAGE_NAME:$GITHUB_SHA" app
+      - uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: 'v0.2.10'
+      - uses: azure/setup-kubectl@v4
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials -g "$AKS_RESOURCE_GROUP" -n "$AKS_NAME" --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/service.yaml -f k8s/hpa.yaml
+          kubectl set image --local -f k8s/deployment.yaml app="$ACR_NAME.azurecr.io/$IMAGE_NAME:$GITHUB_SHA" -o yaml | kubectl apply -f -
+          kubectl rollout status deployment/portfolio-app --timeout=180s
